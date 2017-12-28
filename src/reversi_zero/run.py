@@ -14,4 +14,5 @@ if _PATH_ not in sys.path:
 
 if __name__ == "__main__":
     from reversi_zero import manager
+
     manager.start()

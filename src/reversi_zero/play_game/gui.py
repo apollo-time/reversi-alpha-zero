@@ -12,9 +12,35 @@ from reversi_zero.play_game.game_model import PlayWithHuman, GameEvent
 logger = getLogger(__name__)
 
 
+def ask_model_dir(config: Config):
+    return config.resource.model_dir
+    import os
+    dir = config.resource.generation_model_dir
+    ng_dict = dict(enumerate(os.listdir(dir)))
+    to_print = [f'{x:3}: {ng_dict[x]:50}' for x in ng_dict]
+    to_print = [''.join(to_print[i:i+2]) for i in range(0, len(to_print), 2)]
+    print()
+    for job in to_print:
+        print(job)
+    print()
+
+    max_n = len(ng_dict)
+    while True:
+        n = input(f'select the model generation 0-{max_n-1}: (click ENTER for best model) ')
+        if not n or len(n) == 0:
+            return None
+        try:
+            n = int(n)
+        except Error:
+            continue
+        if 0 <= n < max_n:
+            return os.path.join(dir, ng_dict[n])
+
+
 def start(config: Config):
+    model_dir = ask_model_dir(config)
     PlayWithHumanConfig().update_play_config(config.play)
-    reversi_model = PlayWithHuman(config)
+    reversi_model = PlayWithHuman(config, model_dir)
     app = wx.App()
     Frame(reversi_model, config.gui).Show()
     app.MainLoop()
@@ -31,7 +57,6 @@ class Frame(wx.Frame):
         self.model = model
         self.gui_config = gui_config
         self.is_flip_vertical = False
-        self.show_player_evaluation = True
         wx.Frame.__init__(self, None, -1, self.gui_config.window_title, size=self.gui_config.window_size)
         # panel
         self.panel = wx.Panel(self)
@@ -45,7 +70,6 @@ class Frame(wx.Frame):
         menu.Append(2, u"New Game(White)")
         menu.AppendSeparator()
         menu.Append(5, u"Flip Vertical")
-        menu.Append(6, u"Show/Hide Player evaluation")
         menu.AppendSeparator()
         menu.Append(9, u"quit")
         menu_bar = wx.MenuBar()
@@ -54,7 +78,6 @@ class Frame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.handle_new_game, id=1)
         self.Bind(wx.EVT_MENU, self.handle_new_game, id=2)
         self.Bind(wx.EVT_MENU, self.handle_flip_vertical, id=5)
-        self.Bind(wx.EVT_MENU, self.handle_show_hide_player_evaluation, id=6)
         self.Bind(wx.EVT_MENU, self.handle_quit, id=9)
 
         # status bar
@@ -82,10 +105,6 @@ class Frame(wx.Frame):
         self.is_flip_vertical = not self.is_flip_vertical
         self.panel.Refresh()
 
-    def handle_show_hide_player_evaluation(self, event):
-        self.show_player_evaluation = not self.show_player_evaluation
-        self.panel.Refresh()
-
     def new_game(self, human_is_black):
         self.model.start_game(human_is_black=human_is_black)
         self.model.play_next_turn()
@@ -110,9 +129,12 @@ class Frame(wx.Frame):
             y = 7-y
 
         if not self.model.available(x, y):
+            notify("fail", f'({x},{y}) is unavailable move.')
             return
 
+        logger.info(f'try to move {x} {y}')
         self.model.move(x, y)
+
         self.model.play_next_turn()
 
     def game_over(self):
@@ -130,8 +152,8 @@ class Frame(wx.Frame):
 
     def update_status_bar(self):
         msg = "current player is " + ["White", "Black"][self.model.next_player == Player.black]
-        if self.model.last_evaluation:
-            msg += f"|AI Confidence={self.model.last_evaluation:.4f}"
+        if self.model.ai_confidence:
+            msg += f' | AI Confidence: [{self.model.ai_confidence[0]:0.3}, {self.model.ai_confidence[1]:0.3}]'
         self.SetStatusText(msg)
 
     def refresh(self, event):
@@ -160,12 +182,9 @@ class Frame(wx.Frame):
                 if c is not None:
                     dc.SetBrush(brushes[c])
                     dc.DrawEllipse(x * px, vy * py, px, py)
-                if self.model.last_history:
+                if hasattr(self.model, 'last_history') and self.model.last_history:
                     q_value = self.model.last_history.values[y*8+x]
                     n_value = self.model.last_history.visit[y*8+x]
-                    enemy_q_value = - self.model.last_history.enemy_values[y*8+x]
-                    enemy_n_value = self.model.last_history.enemy_visit[y*8+x]
-
                     dc.SetTextForeground(wx.Colour("blue"))
                     if n_value:
                         dc.DrawText(f"{int(n_value):d}", x*px+2, vy*py+2)
@@ -173,12 +192,3 @@ class Frame(wx.Frame):
                         if q_value < 0:
                             dc.SetTextForeground(wx.Colour("red"))
                         dc.DrawText(f"{int(q_value*100):d}", x*px+2, (vy+1)*py-16)
-
-                    if self.show_player_evaluation:
-                        dc.SetTextForeground(wx.Colour("purple"))
-                        if enemy_n_value:
-                            dc.DrawText(f"{int(enemy_n_value):2d}", (x+1)*px-20, vy*py+2)
-                        if enemy_q_value:
-                            if enemy_q_value < 0:
-                                dc.SetTextForeground(wx.Colour("orange"))
-                            dc.DrawText(f"{int(enemy_q_value*100):2d}", (x+1)*px-24, (vy+1)*py-16)

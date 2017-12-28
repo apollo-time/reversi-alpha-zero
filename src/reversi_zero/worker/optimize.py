@@ -2,45 +2,68 @@ import os
 from datetime import datetime
 from logging import getLogger
 from time import sleep
+from random import randint
+from bisect import bisect
 
-import keras.backend as K
+import tensorflow as tf
 import numpy as np
-from keras.optimizers import SGD
-
-from reversi_zero.agent.model import ReversiModel, objective_function_for_policy, \
-    objective_function_for_value
+import time
+from reversi_zero.env.reversi_env import ReversiEnv
 from reversi_zero.config import Config
 from reversi_zero.lib import tf_util
-from reversi_zero.lib.bitboard import bit_to_array
-from reversi_zero.lib.data_helper import get_game_data_filenames, read_game_data_from_file, \
-    get_next_generation_model_dirs
-from reversi_zero.lib.model_helpler import load_best_model_weight
+from reversi_zero.lib.data_helper import get_game_data_filenames, read_game_data_from_file
+from lockfile.mkdirlockfile import MkdirLockFile
 
 logger = getLogger(__name__)
 
 
-def start(config: Config):
-    tf_util.set_session_config(per_process_gpu_memory_fraction=0.59)
+def start(config: Config, gpu_mem_frac=None):
+    if gpu_mem_frac is not None:
+        config.model.gpu_mem_frac = gpu_mem_frac
     return OptimizeWorker(config).start()
+
+
+class DataSet:
+    def __init__(self, loaded_data):
+        self.length_array = []
+        self.filename_array = []
+
+        total_length = 0
+        for filename in loaded_data:
+            length = len(loaded_data[filename])
+            total_length += length
+
+            self.length_array.append(total_length)
+            self.filename_array.append(filename)
+
+    def locate(self, index):
+        p = bisect(self.length_array, index)
+        offset = index - self.length_array[p-1] if p > 0 else index
+        return self.filename_array[p], offset
+
+    @property
+    def size(self):
+        return self.length_array[-1]
 
 
 class OptimizeWorker:
     def __init__(self, config: Config):
         self.config = config
         self.model = None  # type: ReversiModel
+        self.total_steps = 0
         self.loaded_filenames = set()
         self.loaded_data = {}
         self.dataset = None
         self.optimizer = None
+        self.learning_rate = 0.2
 
     def start(self):
-        self.model = self.load_model()
+        self.model, self.total_steps = self.load_model()
         self.training()
 
     def training(self):
-        self.compile_model()
-        last_load_data_step = last_save_step = total_steps = self.config.trainer.start_total_steps
-        min_data_size_to_learn = 100000
+        last_generation_step = last_save_step = 0
+        min_data_size_to_learn = self.config.trainer.min_data_size_to_learn
         self.load_play_data()
 
         while True:
@@ -49,115 +72,122 @@ class OptimizeWorker:
                 sleep(60)
                 self.load_play_data()
                 continue
-            self.update_learning_rate(total_steps)
+            self.update_learning_rate()
             steps = self.train_epoch(self.config.trainer.epoch_to_checkpoint)
-            total_steps += steps
-            if last_save_step + self.config.trainer.save_model_steps < total_steps:
-                self.save_current_model()
-                last_save_step = total_steps
+            self.total_steps = steps
 
-            if last_load_data_step + self.config.trainer.load_data_steps < total_steps:
+            if last_save_step + self.config.trainer.save_model_steps < self.total_steps:
+                self.save_current_model()
+                last_save_step = self.total_steps
+
+                # TODO: maybe this reload timing is not consistent with the AZ paper...
                 self.load_play_data()
-                last_load_data_step = total_steps
+
+    def generate_train_data(self, batch_size):
+        env = ReversiEnv()
+        # The AZ paper doesn't leverage the symmetric observation data augmentation. But it is nice to use it if we can.
+        symmetric_n = env.rotate_flip_op_count
+
+        while True:
+            orig_data_size = self.dataset.size
+            data_size = orig_data_size * symmetric_n if symmetric_n > 1 else orig_data_size
+
+            x, lm, y1, y2 = [], [], [], []
+            for _ in range(batch_size):
+                n = randint(0, data_size - 1)
+                orig_n = n // symmetric_n if symmetric_n > 1 else n
+
+                file_name, offset = self.dataset.locate(orig_n)
+
+                state, policy, legal_moves, z = self.loaded_data[file_name][offset]
+                state = env.decompress_ob(state)
+
+                if symmetric_n > 1:
+                    op = n % symmetric_n
+                    state = env.rotate_flip_ob(state, op)
+                    policy = env.rotate_flip_pi(policy, op)
+                    legal_moves = env.rotate_flip_pi(legal_moves, op)
+
+                state = np.transpose(state, [1, 2, 0])
+                x.append(state)
+                lm.append(legal_moves)
+                y1.append(policy)
+                y2.append([z])
+
+            x = np.asarray(x)
+            lm = np.asarray(lm)
+            y1 = np.asarray(y1)
+            y2 = np.asarray(y2)
+            yield x, lm, y1, y2
 
     def train_epoch(self, epochs):
         tc = self.config.trainer
-        state_ary, policy_ary, z_ary = self.dataset
-        self.model.model.fit(state_ary, [policy_ary, z_ary],
-                             batch_size=tc.batch_size,
-                             epochs=epochs)
-        steps = (state_ary.shape[0] // tc.batch_size) * epochs
-        return steps
+        epoch = 0
+        start_time = time.time()
+        for x, legal_moves, policy, value in self.generate_train_data(tc.batch_size):
+            step = self.model.train(x, legal_moves, policy, value, self.learning_rate)
+            if step % tc.save_model_steps == 0:
+                global_step, policy_loss, value_loss, reg_loss, total_loss = self.model.train_summary(x, legal_moves, policy, value)
+                logger.info(f"step={global_step} loss policy {policy_loss:0.3} value {value_loss:0.3} reg {reg_loss:0.3} total {total_loss:0.3} time {int(time.time() - start_time)}s")
+                start_time = time.time()
+            epoch += 1
+            if epoch * tc.batch_size > self.dataset_size * epochs * 8:
+                break
 
-    def compile_model(self):
-        self.optimizer = SGD(lr=1e-2, momentum=0.9)
-        losses = [objective_function_for_policy, objective_function_for_value]
-        self.model.model.compile(optimizer=self.optimizer, loss=losses)
+        return global_step
 
-    def update_learning_rate(self, total_steps):
-        # The deepmind paper says
-        # ~400k: 1e-2
-        # 400k~600k: 1e-3
-        # 600k~: 1e-4
+    def update_learning_rate(self):
 
-        if total_steps < 100000:
-            lr = 1e-2
-        elif total_steps < 500000:
-            lr = 1e-3
-        elif total_steps < 900000:
-            lr = 1e-4
-        else:
-            lr = 2.5e-5  # means (1e-4 / 4): the paper batch size=2048, ours is 512.
-        K.set_value(self.optimizer.lr, lr)
-        logger.debug(f"total step={total_steps}, set learning rate to {lr}")
+        for this_lr, till_step in self.config.trainer.lr_schedule:
+            if self.total_steps < till_step:
+                lr = this_lr
+                break
+        self.learning_rate = lr
+        logger.debug(f"total step={self.total_steps}, set learning rate to {lr}")
 
     def save_current_model(self):
-        rc = self.config.resource
-        model_id = datetime.now().strftime("%Y%m%d-%H%M%S.%f")
-        model_dir = os.path.join(rc.next_generation_model_dir, rc.next_generation_model_dirname_tmpl % model_id)
-        os.makedirs(model_dir, exist_ok=True)
-        config_path = os.path.join(model_dir, rc.next_generation_model_config_filename)
-        weight_path = os.path.join(model_dir, rc.next_generation_model_weight_filename)
-        self.model.save(config_path, weight_path)
-
-    def collect_all_loaded_data(self):
-        state_ary_list, policy_ary_list, z_ary_list = [], [], []
-        for s_ary, p_ary, z_ary_ in self.loaded_data.values():
-            state_ary_list.append(s_ary)
-            policy_ary_list.append(p_ary)
-            z_ary_list.append(z_ary_)
-
-        state_ary = np.concatenate(state_ary_list)
-        policy_ary = np.concatenate(policy_ary_list)
-        z_ary = np.concatenate(z_ary_list)
-        return state_ary, policy_ary, z_ary
+        self.model.save(self.config.resource.model_dir, self.total_steps//100)
 
     @property
     def dataset_size(self):
         if self.dataset is None:
             return 0
-        return len(self.dataset[0])
+        return self.dataset.size
 
     def load_model(self):
         from reversi_zero.agent.model import ReversiModel
         model = ReversiModel(self.config)
-        rc = self.config.resource
-
-        dirs = get_next_generation_model_dirs(rc)
-        if not dirs:
-            logger.debug(f"loading best model")
-            if not load_best_model_weight(model):
-                raise RuntimeError(f"Best model can not loaded!")
-        else:
-            latest_dir = dirs[-1]
-            logger.debug(f"loading latest model")
-            config_path = os.path.join(latest_dir, rc.next_generation_model_config_filename)
-            weight_path = os.path.join(latest_dir, rc.next_generation_model_weight_filename)
-            model.load(config_path, weight_path)
-        return model
+        model.build_train(self.config.resource.tensor_log_dir)
+        model.create_session()
+        logger.debug(f"loading model")
+        steps = model.load(self.config.resource.model_dir)
+        if steps is None:
+            steps = 0
+        return model, steps
 
     def load_play_data(self):
-        filenames = get_game_data_filenames(self.config.resource)
-        updated = False
-        for filename in filenames:
-            if filename in self.loaded_filenames:
-                continue
-            self.load_data_from_file(filename)
-            updated = True
+        with MkdirLockFile(self.config.resource.play_data_dir):
+            filenames = get_game_data_filenames(self.config.resource)
+            updated = False
+            for filename in filenames:
+                if filename in self.loaded_filenames:
+                    continue
+                self.load_data_from_file(filename)
+                updated = True
 
-        for filename in (self.loaded_filenames - set(filenames)):
-            self.unload_data_of_file(filename)
-            updated = True
+            for filename in (self.loaded_filenames - set(filenames)):
+                self.unload_data_of_file(filename)
+                updated = True
 
-        if updated:
-            logger.debug("updating training dataset")
-            self.dataset = self.collect_all_loaded_data()
+            if updated:
+                self.dataset = DataSet(self.loaded_data)
+                logger.debug(f"updating training dataset size {self.dataset_size}")
 
     def load_data_from_file(self, filename):
         try:
             logger.debug(f"loading data from {filename}")
             data = read_game_data_from_file(filename)
-            self.loaded_data[filename] = self.convert_to_training_data(data)
+            self.loaded_data[filename] = data
             self.loaded_filenames.add(filename)
         except Exception as e:
             logger.warning(str(e))
@@ -167,22 +197,3 @@ class OptimizeWorker:
         self.loaded_filenames.remove(filename)
         if filename in self.loaded_data:
             del self.loaded_data[filename]
-
-    @staticmethod
-    def convert_to_training_data(data):
-        """
-
-        :param data: format is SelfPlayWorker.buffer
-            list of [(own: bitboard, enemy: bitboard), [policy: float 64 items], z: number]
-        :return:
-        """
-        state_list = []
-        policy_list = []
-        z_list = []
-        for state, policy, z in data:
-            own, enemy = bit_to_array(state[0], 64).reshape((8, 8)), bit_to_array(state[1], 64).reshape((8, 8))
-            state_list.append([own, enemy])
-            policy_list.append(policy)
-            z_list.append(z)
-
-        return np.array(state_list), np.array(policy_list), np.array(z_list)

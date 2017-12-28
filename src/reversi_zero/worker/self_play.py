@@ -1,23 +1,27 @@
 import os
 from datetime import datetime
 from logging import getLogger
-from random import random
 from time import time
-
-from reversi_zero.agent.player import ReversiPlayer
+import copy
+from random import random
+from collections import namedtuple
+import numpy as np
+from lockfile.mkdirlockfile import MkdirLockFile
+from reversi_zero.agent.player import SelfPlayer
 from reversi_zero.config import Config
-from reversi_zero.env.reversi_env import Board, Winner
-from reversi_zero.env.reversi_env import ReversiEnv, Player
+from reversi_zero.env.reversi_env import ReversiEnv
 from reversi_zero.lib import tf_util
 from reversi_zero.lib.data_helper import get_game_data_filenames, write_game_data_to_file
-from reversi_zero.lib.model_helpler import load_best_model_weight, save_as_best_model, \
-    reload_best_model_weight_if_changed
 
 logger = getLogger(__name__)
 
+ResignInfo = namedtuple("ResignInfo", "predict, actual")
+ResignCtrl = namedtuple("ResignCtrl", "v, n, f_p_n")  # v_resign, total_n, false_positive_n
 
-def start(config: Config):
-    tf_util.set_session_config(per_process_gpu_memory_fraction=0.2)
+def start(config: Config, gpu_mem_frac=None):
+    if gpu_mem_frac is not None:
+        config.model.gpu_mem_frac = gpu_mem_frac
+
     return SelfPlayWorker(config, env=ReversiEnv()).start()
 
 
@@ -32,119 +36,131 @@ class SelfPlayWorker:
         self.config = config
         self.model = model
         self.env = env
-        self.black = None  # type: ReversiPlayer
-        self.white = None  # type: ReversiPlayer
-        self.buffer = []
-        self.false_positive_count_of_resign = 0
-        self.resign_test_game_count = 0
+
+    def update_v_resign(self, resign_info, resign_ctrl):
+
+        info = resign_info
+        ctrl = resign_ctrl
+        v_resign_delta = self.config.play.v_resign_delta
+        fraction_t_max = self.config.play.v_resign_false_positive_fraction_t_max
+        fraction_t_min = self.config.play.v_resign_false_positive_fraction_t_min
+        min_n = self.config.play.v_resign_check_min_n
+
+        v, n, f_p_n = ctrl.v, ctrl.n, ctrl.f_p_n
+
+        n += 1
+        f_p_n += 0 if info.predict == info.actual else 1
+
+        fraction = float(f_p_n) / n
+        logger.debug(f'resign f_p frac: {f_p_n} / {n} = {fraction}')
+        if n >= min_n and fraction > fraction_t_max:
+            v -= v_resign_delta
+        elif n >= min_n and fraction < fraction_t_min:
+            v += v_resign_delta
+        else:
+            pass
+
+        if abs(ctrl.v - v) > 1e-10:
+            logger.debug(f'#false_positive={f_p_n}, #n={n}, frac={fraction}, target_fract=[{fraction_t_min},{fraction_t_max}]')
+            logger.debug(f'v_resign change from {ctrl.v} to {v}')
+        return ResignCtrl(v, n, f_p_n)
 
     def start(self):
         if self.model is None:
             self.model = self.load_model()
 
-        self.buffer = []
-        idx = 1
+        buffer = []
+        game_idx = 1
+        resign_ctrl = ResignCtrl(self.config.play.v_resign_init, 0, 0)
 
+        logger.debug("game is on!!!")
         while True:
             start_time = time()
-            env = self.start_game(idx)
+
+            prop = self.config.play.v_resign_disable_prop
+            should_resign = random() >= prop
+            moves, resign_info = self.play_a_game(should_resign, resign_ctrl.v)
+            buffer += moves
+
             end_time = time()
-            logger.debug(f"play game {idx} time={end_time - start_time} sec, "
-                         f"turn={env.turn}:{env.board.number_of_black_and_white}")
-            if (idx % self.config.play_data.nb_game_in_file) == 0:
-                if reload_best_model_weight_if_changed(self.model):
-                    self.reset_false_positive_count()
+            logger.debug(f"play game {game_idx} time={end_time - start_time} sec")
 
-            idx += 1
+            if resign_info.predict is not None:
+                resign_ctrl = self.update_v_resign(resign_info, resign_ctrl)
 
-    def start_game(self, idx):
-        self.env.reset()
-        enable_resign = self.config.play.disable_resignation_rate <= random()
-        self.black = ReversiPlayer(self.config, self.model, enable_resign=enable_resign)
-        self.white = ReversiPlayer(self.config, self.model, enable_resign=enable_resign)
-        if not enable_resign:
-            logger.debug("Resignation is disabled in the next game.")
-        observation = self.env.observation  # type: Board
-        while not self.env.done:
-            # logger.debug(f"turn={self.env.turn}")
-            if self.env.next_player == Player.black:
-                action = self.black.action(observation.black, observation.white)
-            else:
-                action = self.white.action(observation.white, observation.black)
-            observation, info = self.env.step(action)
-        self.finish_game(resign_enabled=enable_resign)
-        self.save_play_data(write=idx % self.config.play_data.nb_game_in_file == 0)
-        self.remove_play_data()
-        return self.env
+            if (game_idx % self.config.play_data.nb_game_in_file) == 0:
+                self.save_play_data(buffer)
+                buffer = []
+                self.remove_old_play_data()
 
-    def save_play_data(self, write=True):
-        data = self.black.moves + self.white.moves
-        self.buffer += data
+                # TODO: maybe this reload time is not consistent with the AZ paper...
+                self.model.load(self.config.resource.model_dir)
 
-        if not write:
-            return
+            game_idx += 1
 
+    def play_a_game(self, should_resign, v_resign):
+        env = self.env.copy()
+        env.reset()
+
+        def make_sim_env_fn():
+            return env.copy()
+
+        player = SelfPlayer(make_sim_env_fn=make_sim_env_fn, config=self.config, model=self.model)
+        player.prepare(root_env=env, dir_noise=True)
+
+        moves = []
+        resign_predicted_winner = None
+
+        while not env.done:
+            tau = 1 if env.turn < self.config.play.change_tau_turn else 0
+            act, pi, vs = player.think(tau)
+
+            if all(v < v_resign for v in vs):
+                if should_resign:
+                    logger.debug(f'Resign: v={vs[0]:.4f}, child_v={vs[1]:.4f}, thres={v_resign:.4f}')
+                    env.resign()
+                    break
+                if resign_predicted_winner is None:
+                    resign_predicted_winner = env.last_player
+
+            moves += [[env.compress_ob(env.observation).tolist(), np.asarray(pi).tolist(), np.asarray(env.legal_moves).tolist()]]
+
+            env.step(act)
+            player.play(act)
+
+        if env.black_wins:
+            z = 1
+        elif env.black_loses:
+            z = -1
+        else:
+            z = 0
+        for i, move in enumerate(moves):
+            move += [z if i%2==0 else -z]
+
+        resign_info = ResignInfo(resign_predicted_winner, env.winner)
+
+        return moves, resign_info
+
+    def save_play_data(self, buffer):
         rc = self.config.resource
         game_id = datetime.now().strftime("%Y%m%d-%H%M%S.%f")
-        path = os.path.join(rc.play_data_dir, rc.play_data_filename_tmpl % game_id)
-        logger.info(f"save play data to {path}")
-        write_game_data_to_file(path, self.buffer)
-        self.buffer = []
+        with MkdirLockFile(rc.play_data_dir):
+            path = os.path.join(rc.play_data_dir, rc.play_data_filename_tmpl % game_id)
+            logger.info(f"save play data to {path}")
+            write_game_data_to_file(path, buffer)
 
-    def remove_play_data(self):
-        files = get_game_data_filenames(self.config.resource)
-        if len(files) < self.config.play_data.max_file_num:
-            return
-        for i in range(len(files) - self.config.play_data.max_file_num):
-            os.remove(files[i])
-
-    def finish_game(self, resign_enabled=True):
-        if self.env.winner == Winner.black:
-            black_win = 1
-            false_positive_of_resign = self.black.resigned
-        elif self.env.winner == Winner.white:
-            black_win = -1
-            false_positive_of_resign = self.white.resigned
-        else:
-            black_win = 0
-            false_positive_of_resign = self.black.resigned or self.white.resigned
-
-        self.black.finish_game(black_win)
-        self.white.finish_game(-black_win)
-
-        if not resign_enabled:
-            self.resign_test_game_count += 1
-            if false_positive_of_resign:
-                self.false_positive_count_of_resign += 1
-                logger.debug("false positive of resignation happened")
-            self.check_and_update_resignation_threshold()
+    def remove_old_play_data(self):
+        with MkdirLockFile(self.config.resource.play_data_dir):
+            files = get_game_data_filenames(self.config.resource)
+            if len(files) < self.config.play_data.max_file_num:
+                return
+            for i in range(len(files) - self.config.play_data.max_file_num):
+                os.remove(files[i])
 
     def load_model(self):
         from reversi_zero.agent.model import ReversiModel
         model = ReversiModel(self.config)
-        if self.config.opts.new or not load_best_model_weight(model):
-            model.build()
-            save_as_best_model(model)
+        rc = self.config.resource
+        model.create_session()
+        model.load(rc.model_dir)
         return model
-
-    def reset_false_positive_count(self):
-        self.false_positive_count_of_resign = 0
-        self.resign_test_game_count = 0
-
-    @property
-    def false_positive_rate(self):
-        if self.resign_test_game_count == 0:
-            return 0
-        return self.false_positive_count_of_resign / self.resign_test_game_count
-
-    def check_and_update_resignation_threshold(self):
-        if self.resign_test_game_count < 100 or self.config.play.resign_threshold is None:
-            return
-
-        old_threshold = self.config.play.resign_threshold
-        if self.false_positive_rate >= self.config.play.false_positive_threshold:
-            self.config.play.resign_threshold -= self.config.play.resign_threshold_delta
-        else:
-            self.config.play.resign_threshold += self.config.play.resign_threshold_delta
-        logger.debug(f"update resign_threshold: {old_threshold} -> {self.config.play.resign_threshold}")
-        self.reset_false_positive_count()

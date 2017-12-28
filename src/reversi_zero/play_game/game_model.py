@@ -1,28 +1,25 @@
 import enum
 from logging import getLogger
 
-from reversi_zero.agent.player import HistoryItem
-from reversi_zero.agent.player import ReversiPlayer
+from reversi_zero.agent.player import EvaluatePlayer
 from reversi_zero.config import Config
 from reversi_zero.env.reversi_env import Player, ReversiEnv
 from reversi_zero.lib.bitboard import find_correct_moves
-from reversi_zero.lib.model_helpler import load_best_model_weight
-
+import numpy as np
 logger = getLogger(__name__)
 
 GameEvent = enum.Enum("GameEvent", "update ai_move over pass")
 
 
 class PlayWithHuman:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, model_dir):
         self.config = config
         self.human_color = None
         self.observers = []
         self.env = ReversiEnv().reset()
-        self.model = self._load_model()
-        self.ai = None  # type: ReversiPlayer
-        self.last_evaluation = None
-        self.last_history = None  # type: HistoryItem
+        self.model = self._load_model(model_dir)
+        self.ai = None  # type: EvaluatePlayer
+        self.ai_confidence = None
 
     def add_observer(self, observer_func):
         self.observers.append(observer_func)
@@ -34,7 +31,11 @@ class PlayWithHuman:
     def start_game(self, human_is_black):
         self.human_color = Player.black if human_is_black else Player.white
         self.env = ReversiEnv().reset()
-        self.ai = ReversiPlayer(self.config, self.model)
+        def make_sim_env_fn():
+            return self.env.copy()
+        self.ai = EvaluatePlayer(make_sim_env_fn=make_sim_env_fn, config=self.config, model=self.model)
+        self.ai.prepare(self.env, dir_noise=False)
+        self.ai_confidence = None
 
     def play_next_turn(self):
         self.notify_all(GameEvent.update)
@@ -45,6 +46,12 @@ class PlayWithHuman:
 
         if self.next_player != self.human_color:
             self.notify_all(GameEvent.ai_move)
+        elif np.amax(self.env.legal_moves) == 0:
+            # pass
+            print('pass move')
+            pos = 64
+            self.env.step(pos)
+            self.ai.play(pos, self.env)
 
     @property
     def over(self):
@@ -56,6 +63,7 @@ class PlayWithHuman:
 
     def stone(self, px, py):
         """left top=(0, 0), right bottom=(7,7)"""
+
         pos = int(py * 8 + px)
         assert 0 <= pos < 64
         bit = 1 << pos
@@ -67,7 +75,7 @@ class PlayWithHuman:
 
     @property
     def number_of_black_and_white(self):
-        return self.env.observation.number_of_black_and_white
+        return self.env.board.number_of_black_and_white
 
     def available(self, px, py):
         pos = int(py * 8 + px)
@@ -84,28 +92,30 @@ class PlayWithHuman:
         assert 0 <= pos < 64
 
         if self.next_player != self.human_color:
-            return False
+            raise Exception('not human\'s turn!')
 
         self.env.step(pos)
 
-    def _load_model(self):
+        self.ai.play(pos, self.env)
+
+    def _load_model(self, model_dir):
         from reversi_zero.agent.model import ReversiModel
         model = ReversiModel(self.config)
-        if not load_best_model_weight(model):
-            raise RuntimeError("best model not found!")
+        model.create_session()
+        model.load(model_dir)
+
         return model
 
     def move_by_ai(self):
         if self.next_player == self.human_color:
-            return False
+            raise Exception('not AI\'s turn!')
 
-        own, enemy = self.get_state_of_next_player()
-        action = self.ai.action(own, enemy)
+        logger.info('start thinking...')
+        action, _, vs = self.ai.think()
+        self.ai_confidence = vs
+        logger.info('end thinking...')
         self.env.step(action)
-
-        self.last_history = self.ai.ask_thought_about(own, enemy)
-        self.last_evaluation = self.last_history.values[self.last_history.action]
-        logger.debug(f"evaluation by ai={self.last_evaluation}")
+        self.ai.play(action, self.env)
 
     def get_state_of_next_player(self):
         if self.next_player == Player.black:
