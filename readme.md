@@ -1,7 +1,10 @@
 About
 =====
+This forked from mokemokechichen/reversi-alpha-zero.
+I implement using tensorflow without Keras, because I don't know keras and inorder to use tensorlite on the mobile devices.
+And I rewrite MCTS with tree structure and use asycio lock for synchronizing instread of time.sleep
 
-Reversi reinforcement learning by [AlphaGo Zero](https://deepmind.com/blog/alphago-zero-learning-scratch/) methods.
+Reversi reinforcement learning by [Alpha Zero](https://deepmind.com/blog/alphago-zero-learning-scratch/) methods.
 
 Environment
 -----------
@@ -9,7 +12,6 @@ Environment
 * Python 3.6.3
 * tensorflow-gpu: 1.3.0
   * tensorflow==1.3.0 is also ok, but very slow. When `play_gui`, tensorflow(cpu) is enough speed.
-* Keras: 2.0.8
 
 Modules
 -------
@@ -20,7 +22,6 @@ This AlphaGo Zero implementation consists of three worker `self`, `opt` and `eva
 
 * `self` is Self-Play to generate training data by self-play using BestModel.
 * `opt` is Trainer to train model, and generate next-generation models.
-* `eval` is Evaluator to evaluate whether the next-generation model is better than BestModel. If better, replace BestModel.
 
 ### Evaluation
 
@@ -179,67 +180,4 @@ sometimes I am competing with iOS app(https://itunes.apple.com/ca/app/id57491596
 
 It takes about 2~3 hours to evaluate one model in my environment.
 Therefore, if you divide the time taken by 3, you can see the approximate number of evaluation times.
-
-|best model generation|date|winning percentage to best model|Time Spent(hours)|note|
-|-----|---|-----|-----|-----|
-|1|-|-|-|　|
-|2|2017/10/24|94.1%|-|　|
-|3|2017/10/24|63.4%|13|　|
-|4|2017/10/25|62.0%|3|　|
-|5|2017/10/25|56.7%|8|　|
-|6|2017/10/25|67.3%|7|　|
-|7|2017/10/25|59.0%|3|　|
-|8|2017/10/26|59.7%|6|　|
-|9|2017/10/26|59.4%|3|　|
-|10|2017/10/26|55.7%|5|　|
-|11|2017/10/26|57.9%|9|　|
-|12|2017/10/27|55.6%|5|　|
-|13|2017/10/27|56.5%|7|　|
-|14|2017/10/28|58.4%|20|　|
-|15|2017/10/28|62.4%|3|　|
-|16|2017/10/28|56.0%|11|　|
-|17|2017/10/29|64.9%|17|　|
-|18|2017/10/30|55.2%|19|　|
-|19|2017/10/31|57.2%|33|　|
-|20|2017/11/01|55.7%|12|　|
-|21|2017/11/01|59.7%|20|　|
-|22|2017/11/02|57.8%|19|　|
-|23|2017/11/03|55.8%|15|　|
-|24|2017/11/03|64.2%|12|　|
-|25|2017/11/04|55.4%|21|　|
-|26|2017/11/04|56.7%|6|　|
-|27|2017/11/05|57.5%|11|　|
-|28|2017/11/06|58.5%|15|　|
-|29|2017/11/06|55.3%|5|　|
-|30|2017/11/06|55.0%|8|　|
-|31|2017/11/06|56.9%|5|　|
-|32|2017/11/07|56.1%|9|　|
-|33|2017/11/08|55.7%|22|　|
-|34|2017/11/08|56.1%|3|　|
-|35|2017/11/08|59.0%|3|　|
-|36|2017/11/08|59.4%|3|　|
-|37|2017/11/08|56.2%|9|　|
-|38|2017/11/10|55.4%|52|Won the app LV9, LV10|
-|39|2017/11/12|57.2%|29|　|
-|40|2017/11/12|55.1%|12|Won the app LV11|
-|41|2017/11/13|55.7%|14|Won the app LV12, 13, 14, 15, 16, 17. I can't win anymore.|
-|42|2017/11/15|57.8%|18|Won the app LV18, 19|
-|43|2017/11/15|55.8%|16|　|
-|44|2017/11/16|57.5%|8|　|
-|45|2017/11/16|56.2%|3|Won the app LV20|
-|46|2017/11/18|55.6%|49|　|
-|47|2017/11/19|55.9%|34|　|
-|48|2017/11/19|59.4%|9|　|
-|49|2017/11/20|55.9%|6|　|
-|50|2017/11/22|56.0%|44|　|
-|51|2017/11/26|55.8%|112|11/25 morning, changed c_puct from 3 to 1.5.|
-|52|2017/11/26|59.7%|6|　|
-|53|2017/11/28|56.2%|33|Won the app LV21|
-|54|2017/11/29|59.0%|24|　|
-|55|2017/12/01|56.6%|58|　|
-|56|2017/12/03|58.1%|49|self-play: always save policy of tau=1|
-|57|2017/12/04|55.1%|24|　|
-|58|2017/12/05|55.9%|35|　|
-|59|2017/12/06|55.4%|6|　|
-|-|2017/12/06|-|-|implement https://github.com/mokemokechicken/reversi-alpha-zero/issues/13|
 
